@@ -1,508 +1,140 @@
-# StellarSend Contracts
+# StellarPOS Contracts
 
-Soroban smart contracts powering the [StellarSend](https://github.com/StellarSend) global money transfer platform. All contracts are written in Rust and deployed on the Stellar network.
+Soroban smart contracts for StellarPOS, a point-of-sale system for merchants
+who accept payment on the Stellar network.
 
----
+[![CI](https://github.com/StellarPOS-App/contracts/actions/workflows/ci.yml/badge.svg)](https://github.com/StellarPOS-App/contracts/actions/workflows/ci.yml)
+![soroban-sdk](https://img.shields.io/badge/soroban--sdk-27.0.6-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
 
-## Table of Contents
+This repository is one of three:
 
-- [Architecture Overview](#architecture-overview)
-- [Contracts](#contracts)
-  - [stellar\_send](#stellar_send)
-  - [fee\_collector](#fee_collector)
-  - [token\_bridge](#token_bridge)
-  - [escrow](#escrow)
-- [Differentiator Features](#differentiator-features)
-  - [Scheduled & recurring payments](#scheduled--recurring-payments)
-  - [Split / batch payments](#split--batch-payments)
-  - [Payment requests / invoicing](#payment-requests--invoicing)
-  - [Escrow / conditional transfers](#escrow--conditional-transfers)
-- [Getting Started](#getting-started)
-- [Building](#building)
-- [Testing](#testing)
-- [Deployment](#deployment)
-- [Contract API Reference](#contract-api-reference)
-- [Events](#events)
-- [Security](#security)
-- [Contributing](#contributing)
-- [License](#license)
-
----
-
-## Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                      User / dApp                        │
-└──────────────────────┬──────────────────────────────────┘
-                       │ send_payment / send_path_payment
-                       ▼
-┌─────────────────────────────────────────────────────────┐
-│               stellar_send  (Entry Point)               │
-│                                                         │
-│  • Validates sender + amount                            │
-│  • Deducts protocol fee (bps)                           │
-│  • Routes payment to recipient                          │
-│  • Emits PaymentSent / PathPaymentSent events           │
-└─────────┬───────────────────────────┬───────────────────┘
-          │ forward fee               │ DEX path swap
-          ▼                           ▼
-┌──────────────────────┐   ┌─────────────────────────────┐
-│    fee_collector     │   │       token_bridge           │
-│                      │   │                              │
-│  • Accumulates fees  │   │  • wrap / unwrap assets      │
-│  • Admin withdrawal  │   │  • Enables cross-asset       │
-│  • Per-token totals  │   │    path payments             │
-└──────────────────────┘   └─────────────────────────────┘
-```
-
-The system is intentionally modular: `stellar_send` is the only contract that end users interact with directly. `fee_collector` and `token_bridge` are infrastructure contracts managed by the protocol admin.
-
----
-
-## Contracts
-
-### stellar\_send
-
-**Path:** `contracts/stellar_send/`
-
-The main entry point for the StellarSend protocol. Supports direct token transfers and DEX path payments between any Stellar addresses.
-
-| Feature | Description |
+| Repository | What it is |
 |---|---|
-| Direct payments | Transfer any SEP-41 token from sender to recipient |
-| Path payments | Route through the Stellar DEX for cross-asset transfers |
-| Fee deduction | Protocol fee in basis points (bps), deducted at source |
-| Pause / unpause | Admin can halt new payments in an emergency |
-| Payment records | Every transfer is stored on-ledger for auditability |
-| Admin rotation | Two-step admin handover (propose → accept) |
+| [`contracts`](https://github.com/StellarPOS-App/contracts) (this repo) | On-chain settlement, loyalty, treasury and escrow |
+| [`backend`](https://github.com/StellarPOS-App/backend) | REST + WebSocket API: catalog, sales, checkout, payment matching |
+| [`surface`](https://github.com/StellarPOS-App/surface) | The point-of-sale web app cashiers and managers use |
 
-**Key data types:**
+## The contracts
 
-```rust
-pub struct ContractConfig {
-    pub admin: Address,
-    pub fee_bps: u32,          // 100 bps = 1%
-    pub fee_collector: Address,
-    pub active: bool,
-    pub min_amount: i128,
-    pub max_amount: i128,
-}
+| Crate | Purpose | Key entry points |
+|---|---|---|
+| [`merchant-registry`](contracts/merchant-registry/src/lib.rs) | Who may get paid, where funds settle, which assets each merchant takes | `register`, `approve`, `suspend`, `accepts`, `settlement_of` |
+| [`payment-processor`](contracts/payment-processor/src/lib.rs) | Atomic sale settlement: fee to treasury, net to merchant, one payment per order | `pay`, `pay_batch`, `refund`, `payment_for_order`, `quote` |
+| [`loyalty-program`](contracts/loyalty-program/src/lib.rs) | Per-merchant points with automatic Bronze/Silver/Gold/Platinum tiers | `enroll`, `accrue`, `redeem`, `get_account` |
+| [`treasury`](contracts/treasury/src/lib.rs) | M-of-N multisig that holds protocol fees and can put idle funds into approved yield vaults | `propose`, `approve`, `execute`, `freeze`, `vaults` |
+| [`escrow-service`](contracts/escrow-service/src/lib.rs) | Held payments for deliveries and pre-orders, with dispute resolution | `create`, `release`, `claim`, `raise_dispute`, `resolve`, `resolve_by_default` |
+| [`payment-stream`](contracts/payment-stream/src/lib.rs) | Per-second payment streams for subscriptions, rent and payroll; cancel splits earned and unearned exactly | `create`, `withdraw`, `cancel`, `available` |
+| [`shared`](contracts/shared/src/lib.rs) | Library, not deployed: basis-point fee math and storage TTL helpers | `bps_of`, `split_fee`, `extend_*` |
 
-pub struct PaymentRecord {
-    pub from: Address,
-    pub to: Address,
-    pub token: Address,
-    pub net_amount: i128,
-    pub fee_amount: i128,
-    pub memo: String,
-    pub ledger: u32,
-}
+### How a sale settles
+
+```mermaid
+sequenceDiagram
+    participant C as Customer wallet
+    participant P as payment-processor
+    participant R as merchant-registry
+    participant T as Token (SAC)
+    participant L as loyalty-program
+    C->>P: pay(payer, merchant, asset, amount, order_ref)
+    P->>R: accepts(merchant, asset)?
+    R-->>P: true
+    P->>R: settlement_of(merchant)
+    P->>T: transfer(payer -> settlement, net)
+    P->>T: transfer(payer -> treasury, fee)
+    P->>L: accrue(processor, merchant, payer, amount)
+    P-->>C: payment id (event: payment_settled)
 ```
 
----
+All transfers happen inside one transaction, so either the whole sale settles
+or nothing moves. The processor never holds customer funds, and the
+`(merchant, order_ref)` pair is unique, so a retried checkout cannot charge
+twice.
 
-### fee\_collector
+### Design rules
 
-**Path:** `contracts/fee_collector/`
+These hold across every contract:
 
-Receives protocol fees forwarded by `stellar_send` and allows the treasury admin to withdraw accumulated balances.
+- **Typed errors, no panics on user input.** Each contract has a
+  `#[contracterror]` enum. Clients get a stable numeric code for every
+  rejection.
+- **Events for every state change**, defined with `#[contractevent]`, so the
+  backend and indexers can follow everything without polling storage.
+- **Emergency pause.** Registry, processor, loyalty and escrow can be paused
+  by their admin. Escrow refunds still work while paused, because returning
+  funds to a buyer is always safe. The treasury uses a multisig freeze
+  instead.
+- **Checked arithmetic.** Fee and split math goes through `shared::bps_of`,
+  which returns `None` on overflow or on more than 100%.
+- **TTL management.** Every read or write of a long-lived record extends its
+  TTL, so active data is never archived.
 
-| Feature | Description |
-|---|---|
-| Fee accounting | Tracks lifetime totals collected per token |
-| Withdrawal | Admin-only; supports arbitrary recipient |
-| Treasury management | Treasury address updatable by admin |
-| Period limits | Configurable withdrawal limit per epoch |
-| Multi-token | Operates on any SEP-41 token |
+More detail on each contract, including state machines and storage layout, is
+in [docs/architecture.md](docs/architecture.md).
 
----
-
-### token\_bridge
-
-**Path:** `contracts/token_bridge/`
-
-A lightweight wrap / unwrap bridge for non-native Stellar assets. Users deposit an underlying token and receive an equal amount of wrapped tokens, enabling cross-asset path payments through the StellarSend DEX flow.
-
-| Feature | Description |
-|---|---|
-| wrap | Deposit underlying → receive wrapped balance |
-| unwrap | Burn wrapped balance → receive underlying |
-| Bridge fee | Configurable bps fee on wrap operations |
-| Supply cap | Configurable maximum wrapped supply |
-| Pause / unpause | Admin can halt wrapping in an emergency |
-| Admin rotation | Two-step admin handover |
-
----
-
-### escrow
-
-**Path:** `contracts/escrow/`
-
-A standalone contract holding funds in on-chain custody until a time or arbiter condition releases them — deposits, marketplace holdbacks, milestone payments. Split out as its own crate (like `fee_collector`/`token_bridge`) since it has its own fund-custody lifecycle independent of `stellar_send`.
-
-| Feature | Description |
-|---|---|
-| Time-locked release | Beneficiary can claim once `unlock_time` has passed |
-| Optional arbiter | Can release to the beneficiary or refund to the depositor at any time |
-| Anti-griefing refund | Depositor can only self-refund after `unlock_time` + a 1-week grace period |
-| Escrow lookup | `get_escrow` for status/UI polling |
-
----
-
-### factory
-
-**Path:** `contracts/factory/`
-
-Deploys and atomically initializes `fee_collector`, `token_bridge`, and
-`stellar_send` instances, closing the front-runnable `initialize()` window
-described in #58. See [Deployment](#deployment) and the crate's module doc
-comment for the full rationale.
-
-| Feature | Description |
-|---|---|
-| Atomic deploy + init | `deploy_fee_collector` / `deploy_token_bridge` / `deploy_stellar_send` deploy the child contract and call its `initialize` within one host invocation |
-| Admin-gated | Every `deploy_*` call requires this factory's own `admin` to authorize |
-
----
-
-## Differentiator Features
-
-StellarSend isn't just a wallet — these on-chain building blocks are what any plain Stellar wallet can't do. All four are implemented directly in the contracts in this repo (`stellar_send` for subscriptions/batch/requests, a new `escrow` crate for conditional transfers), with unit tests covering the happy path and at least one failure case each.
-
-### Scheduled & recurring payments
-
-`stellar_send/src/subscription.rs` — a payer authorizes a recurring transfer once; a keeper (anyone, including an unprivileged bot) can then trigger each due payment without the payer being online.
-
-```rust
-create_subscription(env, payer, recipient, token, amount, interval_seconds, start_time) -> Result<u64, StellarSendError>
-cancel_subscription(env, id) -> Result<(), StellarSendError>
-execute_subscription(env, id) -> Result<i128, StellarSendError>
-get_subscription(env, id) -> Result<Subscription, StellarSendError>
-```
-
-The payer grants the contract a standard SEP-41 token allowance (`token.approve`) when creating the subscription; execution pulls funds via `transfer_from` rather than requiring the payer's live signature, which is what makes unattended, scheduled execution possible while staying non-custodial — the contract enforces the authorization, not a trusted backend. Re-execution before `next_execution_time` is rejected.
-
-### Split / batch payments
-
-`stellar_send/src/batch.rs` — one sender, many recipients, one call.
-
-```rust
-send_batch_payment(env, from, token, payments: Vec<(Address, i128)>) -> Result<Vec<PaymentRecord>, StellarSendError>
-```
-
-Reuses the same fee-splitting logic as `send_payment`. Batches are **all-or-nothing**: every leg is validated up front, and since a Soroban host transaction is atomic, any transfer failure reverts the whole call — there's no partial batch state to reconcile.
-
-### Payment requests / invoicing
-
-`stellar_send/src/payment_request.rs` — turns StellarSend into a two-sided payment tool: a requester creates a shareable "invoice," and a payer fulfills it.
-
-```rust
-create_payment_request(env, requester, payer: Option<Address>, token, amount, memo, expiry) -> Result<u64, StellarSendError>
-fulfill_payment_request(env, request_id, payer) -> Result<i128, StellarSendError>
-cancel_payment_request(env, request_id) -> Result<(), StellarSendError>
-get_payment_request(env, request_id) -> Result<PaymentRequest, StellarSendError>
-```
-
-`payer` is optional — `None` means anyone can fulfill it. Expired or already-fulfilled/cancelled requests are rejected; the protocol fee is deducted exactly as in `send_payment`. The fee rate is locked in when the request is created, so an admin `set_fee` after creation never retroactively changes what the requester nets — the stored `PaymentRequest.fee_bps` (exposed via `get_payment_request`) is what fulfillment applies.
-
-### Escrow / conditional transfers
-
-`escrow/src/lib.rs` — funds locked in-contract until a time or arbiter condition releases them.
-
-```rust
-create_escrow(env, depositor, beneficiary, token, amount, unlock_time, arbiter: Option<Address>) -> Result<u64, EscrowError>
-release_escrow(env, escrow_id, caller) -> Result<(), EscrowError>
-refund_escrow(env, escrow_id, caller) -> Result<(), EscrowError>
-get_escrow(env, escrow_id) -> Result<Escrow, EscrowError>
-```
-
-`caller` must authorize the call itself (`caller.require_auth()`) — the beneficiary can release after `unlock_time`, and an optional arbiter can release **or** refund at any time. The depositor can only self-refund after `unlock_time` plus a one-week grace period, so the beneficiary always gets a fair window to claim before the depositor can walk away with the funds.
-
-> **Note on automation:** because release/refund require the caller's own signature, they can't be executed by an unattended keeper the way subscriptions can — unless the keeper *is* the configured arbiter. The [backend](https://github.com/StellarSend/backend)'s escrow endpoints build an unsigned transaction for whichever party is acting to sign client-side, the same pattern used for a regular payment.
-
----
-
-## Getting Started
+## Getting started
 
 ### Prerequisites
 
-| Tool | Version | Install |
-|---|---|---|
-| Rust | stable (see `rust-toolchain.toml`) | `curl https://sh.rustup.rs -sSf \| sh` |
-| Soroban CLI | ≥ 21.0.0 | `cargo install --locked soroban-cli` |
-| wasm32 target | — | `rustup target add wasm32-unknown-unknown` |
+- Rust stable with the `wasm32v1-none` target (pinned in
+  [`rust-toolchain.toml`](rust-toolchain.toml), installed automatically by
+  rustup)
+- [Stellar CLI](https://developers.stellar.org/docs/tools/cli) 23 or newer,
+  for building optimized wasm and deploying
 
-### Clone and install
+### Build and test
 
 ```bash
-git clone https://github.com/StellarSend/contracts.git
+git clone https://github.com/StellarPOS-App/contracts.git
 cd contracts
+
+make test      # 63 tests across all crates
+make check     # rustfmt + clippy -D warnings + tests (what CI runs)
+make build     # optimized wasm in target/wasm32v1-none/release/
+make sizes     # wasm sizes, all well under the 64 KB limit
+make verify    # check a deployment runs exactly this source (NETWORK=testnet)
 ```
 
-The workspace `Cargo.toml` pins all dependency versions. No additional install step is required.
-
----
-
-## Building
-
-Build all contracts to WASM:
+### Deploy to testnet
 
 ```bash
-make build
-# or directly:
-bash scripts/build.sh
+make deploy                      # NETWORK=testnet, FEE_BPS=100 by default
+NETWORK=testnet FEE_BPS=250 make deploy
 ```
 
-Individual contract:
+[`scripts/deploy.sh`](scripts/deploy.sh) creates and funds a deployer
+identity if needed, deploys all five contracts, initializes them, connects
+the loyalty program to the processor, and writes every contract ID to
+`deployments/<network>.json`. See [docs/deployment.md](docs/deployment.md)
+for the post-deploy checklist (multisig rotation, merchant onboarding) and
+example `stellar contract invoke` calls.
 
-```bash
-soroban contract build --package stellar_send
-soroban contract build --package fee_collector
-soroban contract build --package token_bridge
+## Project layout
+
 ```
-
-Compiled WASM files are written to `target/wasm32-unknown-unknown/release/`.
-
----
-
-## Testing
-
-Run the full test suite:
-
-```bash
-make test
-# or:
-bash scripts/test.sh
+contracts/
+  shared/               fee math and TTL helpers (rlib)
+  merchant-registry/
+  payment-processor/
+  loyalty-program/
+  treasury/
+  escrow-service/
+    src/dispute.rs      dispute reasons, role rules, default rulings
+    tests/              end-to-end dispute scenarios
+docs/                   architecture and deployment guides
+scripts/deploy.sh       deploy + initialize + wire
+deployments/            contract IDs per network (written by deploy.sh)
 ```
-
-Individual contract tests:
-
-```bash
-cargo test -p stellar_send
-cargo test -p fee_collector
-cargo test -p token_bridge
-```
-
-Run with output:
-
-```bash
-cargo test -p stellar_send -- --nocapture
-```
-
----
-
-## Deployment
-
-`fee_collector`, `token_bridge`, and `stellar_send` are deployed and
-initialized exclusively through the **`factory`** contract (`contracts/factory/`).
-Deploying and initializing a Soroban contract are two independently-authorized
-steps; calling any of these three contracts' own `initialize` directly against
-a raw, independently deployed instance is front-runnable — anyone watching the
-ledger for the deploy can call `initialize` first and permanently seize
-`admin` (#58). `factory` closes this by deploying and initializing each
-instance atomically within a single host invocation, so no
-deployed-but-uninitialized state is ever observable on-chain. See
-`contracts/factory/src/lib.rs`'s module doc comment for the full rationale,
-and each contract's own `initialize` doc comment for why it can't defend
-itself against this directly (the pinned `soroban-sdk` gives it no way to).
-
-### Testnet
-
-```bash
-# Set environment
-export STELLAR_NETWORK=testnet
-export STELLAR_RPC_URL=https://soroban-testnet.stellar.org
-export STELLAR_NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
-export STELLAR_ACCOUNT=<your-secret-key-or-identity>
-
-# Deploys factory, then fee_collector, token_bridge, and stellar_send
-# through it — see scripts/deploy.sh for the exact factory calls made.
-bash scripts/deploy.sh [treasury_address] [underlying_token_address]
-```
-
-### Mainnet
-
-Same steps as testnet; update `STELLAR_NETWORK=mainnet`, `STELLAR_RPC_URL`,
-and `STELLAR_NETWORK_PASSPHRASE` for mainnet.
-
-> **Note:** Mainnet deployments require a multi-sig admin key. Refer to the [Security](#security) section. Deploying and initializing the `factory` contract itself remains two separate steps — see its module doc comment for why that residual window is accepted.
-
----
-
-## Contract API Reference
-
-### stellar\_send
-
-#### `initialize(admin, fee_bps, fee_collector) → Result<(), StellarSendError>`
-
-Initialise the contract. Must be called exactly once by `admin`.
-
-- `fee_bps`: Protocol fee in basis points. Range: `0..=MAX_FEE_BPS` (currently 1,000, i.e. 10% max).
-- `fee_collector`: Address of the deployed `fee_collector` contract.
-
-> **Deploy via `factory` only** — see [Deployment](#deployment). Calling this directly against a raw deployed instance is front-runnable (#58).
-
-#### `send_payment(from, to, token, amount, memo) → Result<PaymentRecord, StellarSendError>`
-
-Transfer `amount` of `token` from `from` to `to`. The protocol fee is deducted from `amount` before transfer.
-
-**Requires auth from:** `from`
-
-#### `send_path_payment(from, to, send_token, send_amount, dest_token, min_dest_amount, path) → Result<i128, StellarSendError>`
-
-Route a payment through the Stellar DEX. The fee is deducted from `send_amount` before the swap is attempted.
-
-**Requires auth from:** `from`
-
-#### `set_fee(new_fee_bps) → Result<(), StellarSendError>`
-
-Update the protocol fee. **Admin only.**
-
-#### `pause() / unpause() → Result<(), StellarSendError>`
-
-Halt or resume new payments. **Admin only.**
-
-#### `transfer_admin(new_admin) → Result<(), StellarSendError>`
-
-Propose a new admin (step 1 of 2). **Current admin only.**
-
-#### `accept_admin() → Result<(), StellarSendError>`
-
-Complete the admin rotation (step 2 of 2). **Proposed admin only.**
-
-#### `get_config() → Result<ContractConfig, StellarSendError>`
-
-Return current configuration.
-
-#### `get_payment_record(from, seq) → Result<PaymentRecord, StellarSendError>`
-
-Retrieve a stored payment record by sender address and sequence number.
-Returns `NotInitialized` if the contract itself has never been
-initialized, or `PaymentRecordNotFound` if it has, but no record exists
-for the given `(from, seq)` pair.
-
----
-
-### fee\_collector
-
-#### `initialize(admin, treasury) → Result<(), FeeCollectorError>`
-
-> **Deploy via `factory` only** — see [Deployment](#deployment). Calling this directly against a raw deployed instance is front-runnable (#58), and this contract has no admin-rotation mechanism (#40), so that has no recovery path short of a full redeploy.
-
-#### `collect_fee(token, amount) → Result<(), FeeCollectorError>`
-
-Record fee receipt. The token transfer must already have been made by `stellar_send`.
-
-#### `withdraw(token, amount, recipient) → Result<(), FeeCollectorError>`
-
-Withdraw fees to `recipient`. **Admin only.**
-
-#### `get_balance(token) → i128`
-
-Return current token balance held by the contract.
-
-#### `get_total_collected(token) → i128`
-
-Return the lifetime total of fees collected in `token`.
-
----
-
-### token\_bridge
-
-#### `initialize(admin, underlying_token) → Result<(), TokenBridgeError>`
-
-> **Deploy via `factory` only** — see [Deployment](#deployment). Calling this directly against a raw deployed instance is front-runnable (#58).
-
-#### `wrap(from, amount) → Result<i128, TokenBridgeError>`
-
-Deposit `amount` of underlying token; credit wrapped balance.
-
-Measures the contract's actual underlying-token balance gain around the
-transfer rather than trusting `amount` — a fee-on-transfer or deflationary
-underlying token would otherwise silently under-fund the single shared
-underlying pool every wrapper's `unwrap` draws from. If the measured
-delta doesn't match `amount`, the call is rejected with
-`UnderlyingTransferShortfall` (and, since a `Result::Err` from a contract
-entry point rolls back the whole invocation, the already-executed
-transfer is reverted too — the caller keeps their original balance).
-`underlying_token` is fully caller-chosen at `initialize`; this bridge
-does not attempt to support fee-on-transfer/deflationary tokens, it only
-refuses to let one wrapper's misbehaving-token deposit create a shortfall
-a different, honest wrapper's `unwrap` would later fall into.
-
-#### `unwrap(from, amount) → Result<i128, TokenBridgeError>`
-
-Burn `amount` of wrapped balance; return underlying tokens.
-
-#### `get_wrapped_balance(holder) → i128`
-
-#### `get_underlying_token() → Result<Address, TokenBridgeError>`
-
----
-
-## Events
-
-All contracts emit structured events consumable by the Horizon API or Soroban event subscriptions.
-
-| Contract | Topic | Data |
-|---|---|---|
-| stellar_send | `payment_sent` | `(from, to, token, net_amount, fee_amount, memo)` |
-| stellar_send | `path_payment_sent` | `(from, to, send_token, send_amount, dest_token, dest_amount, fee_amount)` |
-| stellar_send | `fee_updated` | `(old_bps, new_bps)` |
-| stellar_send | `paused / unpaused` | `ledger` |
-| fee_collector | `fee_received` | `(token, amount)` |
-| fee_collector | `fee_withdrawn` | `(token, recipient, amount)` |
-| token_bridge | `wrapped` | `(underlying, amount)` |
-| token_bridge | `unwrapped` | `(underlying, amount)` |
-
-Subscribe to events via Horizon:
-
-```bash
-soroban events --contract-id <CONTRACT_ID> --network testnet
-```
-
----
-
-## Security
-
-### Admin key management
-
-- All admin keys should be multi-sig accounts on mainnet.
-- Admin rotation uses a two-step propose/accept pattern to prevent key loss.
-- The `fee_collector` treasury address is separate from the admin key.
-- `fee_collector`, `token_bridge`, and `stellar_send` must be deployed
-  exclusively through the `factory` contract — see [Deployment](#deployment).
-  Deploying any of them any other way reopens the front-runnable
-  `initialize()` window described in #58.
-
-### Audit status
-
-| Contract | Auditor | Status |
-|---|---|---|
-| stellar\_send | — | In progress |
-| fee\_collector | — | In progress |
-| token\_bridge | — | In progress |
-| factory | — | In progress |
-
-### Reporting vulnerabilities
-
-Please report security issues privately via email to **security@stellarsend.io**. Do **not** open a public issue for a security vulnerability. See [SECURITY.md](SECURITY.md) for our responsible disclosure policy.
-
----
 
 ## Contributing
 
-We welcome contributions! Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
-
-1. Fork the repo
-2. Create a feature branch: `git checkout -b feat/my-feature`
-3. Make your changes and add tests
-4. Run `make test` — all tests must pass
-5. Open a PR against `main`
-
----
+Read [CONTRIBUTING.md](CONTRIBUTING.md). In short: open an issue first for
+anything non-trivial, keep pull requests focused, and run `make check`
+before pushing. Security issues go through [SECURITY.md](SECURITY.md), never
+public issues.
 
 ## License
 
-MIT © 2026 StellarSend. See [LICENSE](LICENSE) for full text.
+[MIT](LICENSE)
+
+## Reentrancy via Callback\n\n**Security fix (issue #168):** Any function that invokes an external contract must complete all internal state writes before the cross-contract call. Soroban's execution model does not prevent reentrancy at the contract level.
